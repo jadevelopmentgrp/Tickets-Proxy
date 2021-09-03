@@ -2,17 +2,13 @@
 ARG RUST_TARGET="x86_64-unknown-linux-musl"
 # Musl target, either x86_64-linux-musl, aarch64-linux-musl, arm-linux-musleabi, etc.
 ARG MUSL_TARGET="x86_64-linux-musl"
-# This ONLY works with defaults which is rather annoying
-# but better than nothing
-# Uses docker's own naming for architectures
-# e.g. x86_64 -> amd64, aarch64 -> arm64v8, arm -> arm32v7
-ARG FINAL_TARGET="amd64"
 # The crate features to build this with
 ARG FEATURES=""
 
 FROM alpine:latest as build
 ARG RUST_TARGET
 ARG MUSL_TARGET
+ARG FEATURES
 
 RUN apk upgrade && \
     apk add curl gcc musl-dev && \
@@ -43,8 +39,13 @@ COPY ./Cargo.toml ./Cargo.toml
 RUN mkdir src/
 RUN echo 'fn main() {}' > ./src/main.rs
 RUN source $HOME/.cargo/env && \
-    cargo build --release \
-        --target="$RUST_TARGET"
+    if [ "$FEATURES" == "" ]; then \
+      cargo build --release \
+          --target="$RUST_TARGET"; \
+    else \
+      cargo build --release \
+          --target="$RUST_TARGET" --features="$FEATURES"; \
+    fi
 
 # Now, delete the fake source and copy in the actual source. This allows us to
 # have a previous compilation step for compiling the dependencies, while being
@@ -60,18 +61,18 @@ RUN rm -f target/$RUST_TARGET/release/deps/twilight_http_proxy*
 COPY ./src ./src
 
 RUN source $HOME/.cargo/env && \
-    cargo build --release \
-        --target="$RUST_TARGET" && \
+    if [ "$FEATURES" == "" ]; then \
+      cargo build --release \
+          --target="$RUST_TARGET"; \
+    else \
+      cargo build --release \
+          --target="$RUST_TARGET" --features="$FEATURES"; \
+    fi && \
     cp target/$RUST_TARGET/release/twilight-http-proxy /twilight-http-proxy && \
     actual-strip /twilight-http-proxy
 
-FROM docker.io/${FINAL_TARGET}/alpine:latest
-ARG TARGET
+FROM scratch
 
-WORKDIR /app
+COPY --from=build /twilight-http-proxy /twilight-http-proxy
 
-# And now copy the binary over from the build container. The build container is
-# based on a heavy image.
-COPY --from=build /twilight-http-proxy /app/twilight-http-proxy
-
-CMD ./twilight-http-proxy
+CMD ["./twilight-http-proxy"]
