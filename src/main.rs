@@ -37,19 +37,18 @@ use std::time::Instant;
 #[cfg(feature = "expose-metrics")]
 use lazy_static::lazy_static;
 #[cfg(feature = "expose-metrics")]
-use prometheus::{HistogramOpts, HistogramVec, Registry, TextEncoder, Encoder};
+use prometheus::{Encoder, HistogramOpts, HistogramVec, Registry, TextEncoder};
 
 #[cfg(feature = "expose-metrics")]
 lazy_static! {
     static ref METRIC_KEY: String =
         env::var("METRIC_KEY").unwrap_or_else(|_| "twilight_http_proxy".into());
-
     static ref REGISTRY: Registry = Registry::new();
-
     static ref HISTOGRAM: HistogramVec = HistogramVec::new(
         HistogramOpts::new(METRIC_KEY.as_str(), "Response Times"),
         &["method", "route", "status", "scope"]
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[tokio::main]
@@ -403,22 +402,16 @@ fn handle_metrics() -> Pin<Box<dyn Future<Output = Result<Response<Body>, Reques
             return Ok(Response::builder()
                 .status(500)
                 .body(Body::from(format!("{:?}", e)))
-                .unwrap())
+                .unwrap());
         }
 
         match String::from_utf8(buffer) {
-            Ok(s) => {
-                Ok(Response::builder()
-                    .body(Body::from(s))
-                    .unwrap())
-            }
+            Ok(s) => Ok(Response::builder().body(Body::from(s)).unwrap()),
 
-            Err(e) => {
-                Ok(Response::builder()
-                    .status(500)
-                    .body(Body::from(format!("{:?}", e)))
-                    .unwrap())
-            }
+            Err(e) => Ok(Response::builder()
+                .status(500)
+                .body(Body::from(format!("{:?}", e)))
+                .unwrap()),
         }
     })
 }
