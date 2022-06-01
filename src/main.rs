@@ -3,19 +3,19 @@ mod ratelimiter_map;
 
 use error::RequestError;
 use http::{
-    header::{AUTHORIZATION, HOST},
+    header::{AUTHORIZATION, CONNECTION, HOST, TRANSFER_ENCODING, UPGRADE},
     HeaderValue, Method as HttpMethod, Uri,
 };
 use hyper::{
     body::Body,
-    client::HttpConnector,
     server::{conn::AddrStream, Server},
     service, Client, Request, Response,
 };
-use hyper_rustls::HttpsConnector;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_trust_dns::{new_trust_dns_http_connector, TrustDnsHttpConnector};
 use ratelimiter_map::RatelimiterMap;
 use std::{
-    convert::TryFrom,
+    convert::{Infallible, TryFrom},
     env,
     error::Error,
     net::{IpAddr, SocketAddr},
@@ -24,17 +24,15 @@ use std::{
 };
 use tracing::{debug, error, info, trace};
 use tracing_subscriber::EnvFilter;
-use twilight_http::{
-    ratelimiting::{RatelimitHeaders, Ratelimiter},
-    request::Method,
-    routing::Path,
+use twilight_http_ratelimiting::{
+    InMemoryRatelimiter, Method, Path, RatelimitHeaders, Ratelimiter,
 };
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
 #[cfg(feature = "expose-metrics")]
-use std::{future::Future, pin::Pin, time::Instant};
+use std::time::Instant;
 
 #[cfg(feature = "expose-metrics")]
 use lazy_static::lazy_static;
@@ -50,7 +48,7 @@ lazy_static! {
 
     static ref HISTOGRAM: HistogramVec = HistogramVec::new(
         HistogramOpts::new(METRIC_KEY.as_str(), "Response Times"),
-        &["method", "route", "status"]
+        &["method", "route", "status", "scope"]
     ).unwrap();
 }
 
@@ -66,7 +64,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let host = IpAddr::from_str(&host_raw)?;
     let port = env::var("PORT").unwrap_or_else(|_| "80".into()).parse()?;
 
-    let client: Client<_, Body> = Client::builder().build(HttpsConnector::with_webpki_roots());
+    let https_connector = {
+        let mut http_connector = new_trust_dns_http_connector();
+        http_connector.enforce_http(false);
+
+        let builder = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_only()
+            .enable_http1();
+
+        if env::var("DISABLE_HTTP2").is_ok() {
+            builder.wrap_connector(http_connector)
+        } else {
+            builder.enable_http2().wrap_connector(http_connector)
+        }
+    };
+
+    let client: Client<_, Body> = Client::builder().build(https_connector);
     let ratelimiter_map = Arc::new(RatelimiterMap::new(env::var("DISCORD_TOKEN")?));
 
     let address = SocketAddr::from((host, port));
@@ -83,27 +97,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let client = client.clone();
 
         async move {
-            Ok::<_, RequestError>(service::service_fn(move |incoming: Request<Body>| {
+            Ok::<_, Infallible>(service::service_fn(move |incoming: Request<Body>| {
                 let token = incoming
                     .headers()
                     .get("authorization")
                     .and_then(|value| value.to_str().ok());
                 let (ratelimiter, token) = ratelimiter_map.get_or_insert(token);
+                let client = client.clone();
 
                 #[cfg(feature = "expose-metrics")]
                 {
-                    let uri = incoming.uri();
+                    let handle = handle.clone();
 
-                    if uri.path() == "/metrics" {
-                        handle_metrics()
-                    } else {
-                        Box::pin(handle_request(client.clone(), ratelimiter, token, incoming))
+                    async move {
+                        Ok::<_, Infallible>({
+                            if incoming.uri().path() == "/metrics" {
+                                handle_metrics()
+                            } else {
+                                handle_request(client, ratelimiter, token, incoming)
+                                    .await
+                                    .unwrap_or_else(|err| err.as_response())
+                            }
+                        })
                     }
                 }
 
                 #[cfg(not(feature = "expose-metrics"))]
                 {
-                    handle_request(client.clone(), ratelimiter, token, incoming)
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_request(client, ratelimiter, token, incoming)
+                                .await
+                                .unwrap_or_else(|err| err.as_response()),
+                        )
+                    }
                 }
             }))
         }
@@ -142,26 +169,36 @@ async fn shutdown_signal() {
 
 fn path_name(path: &Path) -> &'static str {
     match path {
+        Path::ApplicationCommand(..) => "Application commands",
+        Path::ApplicationCommandId(..) => "Application command",
+        Path::ApplicationGuildCommand(..) => "Application commands in guild",
+        Path::ApplicationGuildCommandId(..) => "Application command in guild",
         Path::ChannelsId(..) => "Channel",
+        Path::ChannelsIdFollowers(..) => "Channel followers",
         Path::ChannelsIdInvites(..) => "Channel invite",
         Path::ChannelsIdMessages(..) | Path::ChannelsIdMessagesId(..) => "Channel message",
         Path::ChannelsIdMessagesBulkDelete(..) => "Bulk delete message",
+        Path::ChannelsIdMessagesIdCrosspost(..) => "Crosspost message",
         Path::ChannelsIdMessagesIdReactions(..) => "Message reaction",
         Path::ChannelsIdMessagesIdReactionsUserIdType(..) => "Message reaction for user",
+        Path::ChannelsIdMessagesIdThreads(_) => "Threads of a specific message",
         Path::ChannelsIdPermissionsOverwriteId(..) => "Channel permission override",
         Path::ChannelsIdPins(..) => "Channel pins",
         Path::ChannelsIdPinsMessageId(..) => "Specific channel pin",
+        Path::ChannelsIdRecipients(..) => "Channel recipients",
+        Path::ChannelsIdThreadMembers(_) => "Thread members",
+        Path::ChannelsIdThreads(_) => "Channel threads",
         Path::ChannelsIdTyping(..) => "Typing indicator",
         Path::ChannelsIdWebhooks(..) | Path::WebhooksId(..) => "Webhook",
         Path::Gateway => "Gateway",
         Path::GatewayBot => "Gateway bot info",
         Path::Guilds => "Guilds",
         Path::GuildsId(..) => "Guild",
-        Path::GuildsIdBans(..) => "Guild bans",
         Path::GuildsIdAuditLogs(..) => "Guild audit logs",
+        Path::GuildsIdBans(..) => "Guild bans",
+        Path::GuildsIdBansId(..) => "Specific guild ban",
         Path::GuildsIdBansUserId(..) => "Guild ban for user",
         Path::GuildsIdChannels(..) => "Guild channel",
-        Path::GuildsIdWidget(..) => "Guild widget",
         Path::GuildsIdEmojis(..) => "Guild emoji",
         Path::GuildsIdEmojisId(..) => "Specific guild emoji",
         Path::GuildsIdIntegrations(..) => "Guild integrations",
@@ -172,37 +209,40 @@ fn path_name(path: &Path) -> &'static str {
         Path::GuildsIdMembersId(..) => "Specific guild member",
         Path::GuildsIdMembersIdRolesId(..) => "Guild member role",
         Path::GuildsIdMembersMeNick(..) => "Modify own nickname",
+        Path::GuildsIdMembersSearch(..) => "Search guild members",
         Path::GuildsIdPreview(..) => "Guild preview",
         Path::GuildsIdPrune(..) => "Guild prune",
         Path::GuildsIdRegions(..) => "Guild region",
         Path::GuildsIdRoles(..) => "Guild roles",
         Path::GuildsIdRolesId(..) => "Specific guild role",
-        Path::GuildsIdVanityUrl(..) => "Guild vanity invite",
-        Path::GuildsIdWebhooks(..) => "Guild webhooks",
-        Path::InvitesCode => "Invite info",
-        Path::UsersId => "User info",
-        Path::UsersIdConnections => "User connections",
-        Path::UsersIdChannels => "User channels",
-        Path::UsersIdGuilds => "User in guild",
-        Path::UsersIdGuildsId => "Guild from user",
-        Path::VoiceRegions => "Voice region list",
-        Path::OauthApplicationsMe => "Current application info",
-        Path::ChannelsIdMessagesIdCrosspost(..) => "Crosspost message",
-        Path::ChannelsIdRecipients(..) => "Channel recipients",
-        Path::ChannelsIdFollowers(..) => "Channel followers",
-        Path::GuildsIdBansId(..) => "Specific guild ban",
-        Path::GuildsIdMembersSearch(..) => "Search guild members",
+        Path::GuildsIdScheduledEvents(_) => "Scheduled events in guild",
+        Path::GuildsIdScheduledEventsId(_) => "Scheduled event in guild",
+        Path::GuildsIdScheduledEventsIdUsers(_) => "Users of a scheduled event",
+        Path::GuildsIdStickers(_) => "Guild stickers",
         Path::GuildsIdTemplates(..) => "Guild templates",
         Path::GuildsIdTemplatesCode(..) => "Specific guild template",
+        Path::GuildsIdThreads(_) => "Guild threads",
+        Path::GuildsIdVanityUrl(..) => "Guild vanity invite",
         Path::GuildsIdVoiceStates(..) => "Guild voice states",
+        Path::GuildsIdWebhooks(..) => "Guild webhooks",
         Path::GuildsIdWelcomeScreen(..) => "Guild welcome screen",
-        Path::WebhooksIdTokenMessagesId(..) => "Specific webhook message",
-        Path::ApplicationCommand(..) => "Application commands",
-        Path::ApplicationCommandId(..) => "Application command",
-        Path::ApplicationGuildCommand(..) => "Application commands in guild",
-        Path::ApplicationGuildCommandId(..) => "Application command in guild",
+        Path::GuildsIdWidget(..) => "Guild widget",
+        Path::GuildsTemplatesCode(_) => "Specific guild template",
         Path::InteractionCallback(..) => "Interaction callback",
+        Path::InvitesCode => "Invite info",
+        Path::OauthApplicationsMe => "Current application info",
         Path::StageInstances => "Stage instances",
+        Path::StickerPacks => "Sticker packs",
+        Path::Stickers => "Stickers",
+        Path::UsersId => "User info",
+        Path::UsersIdChannels => "User channels",
+        Path::UsersIdConnections => "User connections",
+        Path::UsersIdGuilds => "User in guild",
+        Path::UsersIdGuildsId => "Guild from user",
+        Path::UsersIdGuildsIdMember => "Member of a guild",
+        Path::VoiceRegions => "Voice region list",
+        Path::WebhooksIdToken(_, _) => "Webhook",
+        Path::WebhooksIdTokenMessagesId(..) => "Specific webhook message",
         _ => "Unknown path!",
     }
 }
@@ -225,8 +265,8 @@ fn normalize_path(request_path: &str) -> (&str, &str) {
 }
 
 async fn handle_request(
-    client: Client<HttpsConnector<HttpConnector>, Body>,
-    ratelimiter: Ratelimiter,
+    client: Client<HttpsConnector<TrustDnsHttpConnector>, Body>,
+    ratelimiter: InMemoryRatelimiter,
     token: String,
     mut request: Request<Body>,
 ) -> Result<Response<Body>, RequestError> {
@@ -263,7 +303,7 @@ async fn handle_request(
 
     let p = path_name(&path);
 
-    let header_sender = match ratelimiter.ticket(path).await {
+    let header_sender = match ratelimiter.wait_for_ticket(path).await {
         Ok(sender) => sender,
         Err(e) => {
             error!("Failed to receive ticket for ratelimiting: {:?}", e);
@@ -279,6 +319,14 @@ async fn handle_request(
     request
         .headers_mut()
         .insert(HOST, HeaderValue::from_static("discord.com"));
+
+    // Remove forbidden HTTP/2 headers
+    // https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
+    request.headers_mut().remove(CONNECTION);
+    request.headers_mut().remove("keep-alive");
+    request.headers_mut().remove("proxy-connection");
+    request.headers_mut().remove(TRANSFER_ENCODING);
+    request.headers_mut().remove(UPGRADE);
 
     let mut uri_string = format!("https://discord.com{}{}", api_path, trimmed_path);
 
@@ -314,7 +362,7 @@ async fn handle_request(
     )
     .ok();
 
-    if header_sender.send(ratelimit_headers).is_err() {
+    if header_sender.headers(ratelimit_headers).is_err() {
         error!("Error when sending ratelimit headers to ratelimiter");
     };
 
@@ -324,10 +372,20 @@ async fn handle_request(
     trace!("Response: {:?}", resp);
 
     let status = resp.status();
+
     #[cfg(feature = "expose-metrics")]
-    HISTOGRAM
-        .with_label_values(&[m, p, resp.status().to_string().as_str()])
-        .observe((end - start).as_secs_f64());
+    {
+        let scope = resp
+            .headers()
+            .get("X-RateLimit-Scope")
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        HISTOGRAM
+            .with_label_values(&[m, p, resp.status().to_string().as_str(), scope.as_str()])
+            .observe((end - start).as_secs_f64());
+    }
 
     debug!("{} {} ({}): {}", m, p, request_path, status);
 
