@@ -106,12 +106,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 #[cfg(feature = "expose-metrics")]
                 {
-                    let handle = handle.clone();
-
                     async move {
                         Ok::<_, Infallible>({
                             if incoming.uri().path() == "/metrics" {
-                                handle_metrics()
+                                handle_metrics().unwrap_or_else(|err| err.as_response())
                             } else {
                                 handle_request(client, ratelimiter, token, incoming)
                                     .await
@@ -392,26 +390,25 @@ async fn handle_request(
 }
 
 #[cfg(feature = "expose-metrics")]
-fn handle_metrics() -> Pin<Box<dyn Future<Output = Result<Response<Body>, RequestError>> + Send>> {
-    Box::pin(async move {
-        let mut buffer = Vec::new();
+fn handle_metrics() -> Result<Response<Body>, RequestError> {
+    let mut buffer = Vec::new();
 
-        if let Err(e) = TextEncoder::new().encode(&REGISTRY.gather(), &mut buffer) {
-            error!("error while encoding metrics: {:?}", e);
+    let encoder = TextEncoder::new();
+    if let Err(e) = encoder.encode(&REGISTRY.gather(), &mut buffer) {
+        error!("error while encoding metrics: {:?}", e);
 
-            return Ok(Response::builder()
-                .status(500)
-                .body(Body::from(format!("{:?}", e)))
-                .unwrap());
-        }
+        return Ok(Response::builder()
+            .status(500)
+            .body(Body::from(format!("{:?}", e)))
+            .unwrap());
+    }
 
-        match String::from_utf8(buffer) {
-            Ok(s) => Ok(Response::builder().body(Body::from(s)).unwrap()),
+    match String::from_utf8(buffer) {
+        Ok(s) => Ok(Response::builder().body(Body::from(s)).unwrap()),
 
-            Err(e) => Ok(Response::builder()
-                .status(500)
-                .body(Body::from(format!("{:?}", e)))
-                .unwrap()),
-        }
-    })
+        Err(e) => Ok(Response::builder()
+            .status(500)
+            .body(Body::from(format!("{:?}", e)))
+            .unwrap()),
+    }
 }
