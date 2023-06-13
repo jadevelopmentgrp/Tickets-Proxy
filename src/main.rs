@@ -1,4 +1,5 @@
 mod error;
+mod expiring_lru;
 mod ratelimiter_map;
 
 use error::RequestError;
@@ -12,7 +13,7 @@ use hyper::{
     service, Client, Request, Response,
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_trust_dns::{new_trust_dns_http_connector, TrustDnsHttpConnector};
+use hyper_trust_dns::{TrustDnsHttpConnector, TrustDnsResolver};
 use ratelimiter_map::RatelimiterMap;
 use std::{
     convert::{Infallible, TryFrom},
@@ -22,7 +23,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use twilight_http_ratelimiting::{
     InMemoryRatelimiter, Method, Path, RatelimitHeaders, Ratelimiter,
@@ -64,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let port = env::var("PORT").unwrap_or_else(|_| "80".into()).parse()?;
 
     let https_connector = {
-        let mut http_connector = new_trust_dns_http_connector();
+        let mut http_connector = TrustDnsResolver::default().into_http_connector();
         http_connector.enforce_http(false);
 
         let builder = HttpsConnectorBuilder::new()
@@ -178,13 +179,14 @@ fn path_name(path: &Path) -> &'static str {
         Path::ChannelsIdMessagesIdCrosspost(..) => "Crosspost message",
         Path::ChannelsIdMessagesIdReactions(..) => "Message reaction",
         Path::ChannelsIdMessagesIdReactionsUserIdType(..) => "Message reaction for user",
-        Path::ChannelsIdMessagesIdThreads(_) => "Threads of a specific message",
+        Path::ChannelsIdMessagesIdThreads(..) => "Threads of a specific message",
         Path::ChannelsIdPermissionsOverwriteId(..) => "Channel permission override",
         Path::ChannelsIdPins(..) => "Channel pins",
         Path::ChannelsIdPinsMessageId(..) => "Specific channel pin",
         Path::ChannelsIdRecipients(..) => "Channel recipients",
-        Path::ChannelsIdThreadMembers(_) => "Thread members",
-        Path::ChannelsIdThreads(_) => "Channel threads",
+        Path::ChannelsIdThreadMembers(..) => "Thread members",
+        Path::ChannelsIdThreadMembersId(..) => "Thread member",
+        Path::ChannelsIdThreads(..) => "Channel threads",
         Path::ChannelsIdTyping(..) => "Typing indicator",
         Path::ChannelsIdWebhooks(..) | Path::WebhooksId(..) => "Webhook",
         Path::Gateway => "Gateway",
@@ -192,6 +194,8 @@ fn path_name(path: &Path) -> &'static str {
         Path::Guilds => "Guilds",
         Path::GuildsId(..) => "Guild",
         Path::GuildsIdAuditLogs(..) => "Guild audit logs",
+        Path::GuildsIdAutoModerationRules(..) => "Guild automoderation rules",
+        Path::GuildsIdAutoModerationRulesId(..) => "Guild automoderation rule",
         Path::GuildsIdBans(..) => "Guild bans",
         Path::GuildsIdBansId(..) => "Specific guild ban",
         Path::GuildsIdBansUserId(..) => "Guild ban for user",
@@ -207,24 +211,25 @@ fn path_name(path: &Path) -> &'static str {
         Path::GuildsIdMembersIdRolesId(..) => "Guild member role",
         Path::GuildsIdMembersMeNick(..) => "Modify own nickname",
         Path::GuildsIdMembersSearch(..) => "Search guild members",
+        Path::GuildsIdMfa(..) => "Guild MFA setting",
         Path::GuildsIdPreview(..) => "Guild preview",
         Path::GuildsIdPrune(..) => "Guild prune",
         Path::GuildsIdRegions(..) => "Guild region",
         Path::GuildsIdRoles(..) => "Guild roles",
         Path::GuildsIdRolesId(..) => "Specific guild role",
-        Path::GuildsIdScheduledEvents(_) => "Scheduled events in guild",
-        Path::GuildsIdScheduledEventsId(_) => "Scheduled event in guild",
-        Path::GuildsIdScheduledEventsIdUsers(_) => "Users of a scheduled event",
-        Path::GuildsIdStickers(_) => "Guild stickers",
+        Path::GuildsIdScheduledEvents(..) => "Scheduled events in guild",
+        Path::GuildsIdScheduledEventsId(..) => "Scheduled event in guild",
+        Path::GuildsIdScheduledEventsIdUsers(..) => "Users of a scheduled event",
+        Path::GuildsIdStickers(..) => "Guild stickers",
         Path::GuildsIdTemplates(..) => "Guild templates",
         Path::GuildsIdTemplatesCode(..) => "Specific guild template",
-        Path::GuildsIdThreads(_) => "Guild threads",
+        Path::GuildsIdThreads(..) => "Guild threads",
         Path::GuildsIdVanityUrl(..) => "Guild vanity invite",
         Path::GuildsIdVoiceStates(..) => "Guild voice states",
         Path::GuildsIdWebhooks(..) => "Guild webhooks",
         Path::GuildsIdWelcomeScreen(..) => "Guild welcome screen",
         Path::GuildsIdWidget(..) => "Guild widget",
-        Path::GuildsTemplatesCode(_) => "Specific guild template",
+        Path::GuildsTemplatesCode(..) => "Specific guild template",
         Path::InteractionCallback(..) => "Interaction callback",
         Path::InvitesCode => "Invite info",
         Path::OauthApplicationsMe => "Current application info",
@@ -238,7 +243,7 @@ fn path_name(path: &Path) -> &'static str {
         Path::UsersIdGuildsId => "Guild from user",
         Path::UsersIdGuildsIdMember => "Member of a guild",
         Path::VoiceRegions => "Voice region list",
-        Path::WebhooksIdToken(_, _) => "Webhook",
+        Path::WebhooksIdToken(..) => "Webhook",
         Path::WebhooksIdTokenMessagesId(..) => "Specific webhook message",
         _ => "Unknown path!",
     }
@@ -411,4 +416,21 @@ fn handle_metrics() -> Result<Response<Body>, RequestError> {
             .body(Body::from(format!("{:?}", e)))
             .unwrap()),
     }
+}
+
+pub fn parse_env<T: FromStr>(key: &str) -> Option<T> {
+    env::var_os(key).and_then(|value| match value.into_string() {
+        Ok(s) => {
+            if let Ok(t) = s.parse() {
+                Some(t)
+            } else {
+                warn!("Unable to parse {}, proceeding with defaults", key);
+                None
+            }
+        }
+        Err(s) => {
+            warn!("{} is not UTF-8: {:?}", key, s);
+            None
+        }
+    })
 }
