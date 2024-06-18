@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-util = { version = "0.7.8", default-features = false, features = ["time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-twilight-http-ratelimiting = { git = "https://github.com/twilight-rs/twilight.git", rev = "280437bb81e71a6992cf74619f819bc8f8c42d42" } # HEAD on 2024-06-15
+twilight-http-ratelimiting = { git = "https://github.com/rxdn/twilight.git", branch = "patch/rxdn-0001" }
 prometheus = { version = "0.13", optional = true }
 lazy_static = { version = "1.4", optional = true }
 
