@@ -1,7 +1,9 @@
+mod bad_webhook_map;
 mod error;
 mod expiring_lru;
 mod ratelimiter_map;
 
+use bad_webhook_map::BadWebhookMap;
 use error::RequestError;
 use http::{
     header::{AUTHORIZATION, CONNECTION, HOST, TRANSFER_ENCODING, UPGRADE},
@@ -22,6 +24,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
@@ -83,6 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let client: Client<_, Body> = Client::builder().build(https_connector);
     let ratelimiter_map = Arc::new(RatelimiterMap::new(env::var("DISCORD_TOKEN")?));
+    let bad_webhook_map = BadWebhookMap::new(Duration::from_secs(5 * 60));
 
     let address = SocketAddr::from((host, port));
 
@@ -94,6 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let service = service::make_service_fn(move |addr: &AddrStream| {
         trace!("Connection from: {:?}", addr);
         let ratelimiter_map = ratelimiter_map.clone();
+        let bad_webhook_map = bad_webhook_map.clone();
         // Cloning a hyper client is fairly cheap by design
         let client = client.clone();
 
@@ -104,6 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .get("authorization")
                     .and_then(|value| value.to_str().ok());
                 let (ratelimiter, token) = ratelimiter_map.get_or_insert(token);
+                let bad_webhook_map = bad_webhook_map.clone();
                 let client = client.clone();
 
                 #[cfg(feature = "expose-metrics")]
@@ -113,9 +119,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if incoming.uri().path() == "/metrics" {
                                 handle_metrics().unwrap_or_else(|err| err.as_response())
                             } else {
-                                handle_request(client, ratelimiter, token, incoming)
-                                    .await
-                                    .unwrap_or_else(|err| err.as_response())
+                                handle_request(
+                                    client,
+                                    ratelimiter,
+                                    bad_webhook_map,
+                                    token,
+                                    incoming,
+                                )
+                                .await
+                                .unwrap_or_else(|err| err.as_response())
                             }
                         })
                     }
@@ -125,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 {
                     async move {
                         Ok::<_, Infallible>(
-                            handle_request(client, ratelimiter, token, incoming)
+                            handle_request(client, ratelimiter, bad_webhook_map, token, incoming)
                                 .await
                                 .unwrap_or_else(|err| err.as_response()),
                         )
@@ -270,6 +282,7 @@ fn normalize_path(request_path: &str) -> (&str, &str) {
 async fn handle_request(
     client: Client<HttpsConnector<TrustDnsHttpConnector>, Body>,
     ratelimiter: InMemoryRatelimiter,
+    bad_webhook_map: BadWebhookMap,
     token: String,
     mut request: Request<Body>,
 ) -> Result<Response<Body>, RequestError> {
@@ -304,9 +317,29 @@ async fn handle_request(
         }
     };
 
+    match &path {
+        Path::WebhooksIdToken(id, token) | Path::WebhooksIdTokenMessagesId(id, token) => {
+            if bad_webhook_map.is_known_bad(*id, token) {
+                debug!(
+                    webhook_id = *id,
+                    token = token,
+                    "Webhook is known to be bad, returning simulated response"
+                );
+
+                return Ok(Response::builder()
+                    .status(404)
+                    .body(Body::from(
+                        r#"{"message": "Unknown Webhook", "code": 10015}"#,
+                    )) // Simulate Discord API response
+                    .unwrap());
+            }
+        }
+        _ => {}
+    }
+
     let p = path_name(&path);
 
-    let header_sender = match ratelimiter.wait_for_ticket(path).await {
+    let header_sender = match ratelimiter.wait_for_ticket(path.clone()).await {
         Ok(sender) => sender,
         Err(e) => {
             error!("Failed to receive ticket for ratelimiting: {:?}", e);
@@ -375,6 +408,15 @@ async fn handle_request(
     trace!("Response: {:?}", resp);
 
     let status = resp.status();
+
+    if status.as_u16() == 404 {
+        match &path {
+            Path::WebhooksIdToken(id, token) | Path::WebhooksIdTokenMessagesId(id, token) => {
+                bad_webhook_map.mark_bad(*id, token)
+            }
+            _ => {}
+        }
+    }
 
     #[cfg(feature = "expose-metrics")]
     {
