@@ -389,9 +389,28 @@ async fn handle_request(
             .observe((end - start).as_secs_f64());
     }
 
-    debug!("{} {} ({}): {}", m, p, request_path, status);
+    debug!(
+        url = request_path,
+        status = status.as_u16(),
+        method = m,
+        route = p,
+        x_ratelimit_limit = header_to_str(&resp, "x-ratelimit-limit"),
+        x_ratelimit_remaining = header_to_str(&resp, "x-ratelimit-remaining"),
+        x_ratelimit_reset = header_to_str(&resp, "x-ratelimit-reset"),
+        x_ratelimit_reset_after = header_to_str(&resp, "x-ratelimit-reset-after"),
+        x_ratelimit_bucket = header_to_str(&resp, "x-ratelimit-bucket"),
+        x_ratelimit_global = header_to_str(&resp, "x-ratelimit-global"),
+        x_ratelimit_scope = header_to_str(&resp, "x-ratelimit-scope"),
+    );
 
     Ok(resp)
+}
+
+fn header_to_str<'a, T>(resp: &'a Response<T>, header: &str) -> &'a str {
+    resp.headers()
+        .get(header)
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or_else(move || "None")
 }
 
 #[cfg(feature = "expose-metrics")]
