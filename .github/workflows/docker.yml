@@ -9,6 +9,9 @@ jobs:
   build-images:
     name: Build Docker Images
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -89,6 +92,9 @@ jobs:
     name: Create Docker manifests
     runs-on: ubuntu-latest
     needs: build-images
+    permissions:
+      contents: read
+      packages: write
     if: github.event_name != 'pull_request'
 
     steps:
